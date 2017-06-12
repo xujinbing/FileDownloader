@@ -44,6 +44,9 @@ import java.net.HttpURLConnection;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ThreadPoolExecutor;
 
 /**
@@ -102,14 +105,12 @@ public class DownloadLaunchRunnable implements Runnable, ProcessCallback {
     private boolean acceptPartial;
     private boolean isChunked;
 
-    private volatile boolean alive;
     private volatile boolean paused;
 
     private DownloadLaunchRunnable(FileDownloadModel model, FileDownloadHeader header,
                                    IThreadPoolMonitor threadPoolMonitor,
                                    final int minIntervalMillis, int callbackProgressMaxCount,
                                    boolean isForceReDownload, boolean isWifiRequired, int maxRetryTimes) {
-        this.alive = true;
         this.paused = false;
         this.isTriedFixRangeNotSatisfiable = false;
 
@@ -159,134 +160,130 @@ public class DownloadLaunchRunnable implements Runnable, ProcessCallback {
 
     @Override
     public void run() {
-        try {
-            Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+        Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
 
-            // status checkout
-            if (model.getStatus() != FileDownloadStatus.pending) {
-                if (model.getStatus() == FileDownloadStatus.paused) {
-                    if (FileDownloadLog.NEED_LOG) {
-                        /**
-                         * @see FileDownloadThreadPool#cancel(int), the invoking simultaneously
-                         * with here. And this area is invoking before there, so, {@code cancel(int)}
-                         * is fail.
-                         *
-                         * High concurrent cause.
-                         */
-                        FileDownloadLog.d(this, "High concurrent cause, start runnable but " +
-                                "already paused %d", model.getId());
-                    }
+        // status checkout
+        if (model.getStatus() != FileDownloadStatus.pending) {
+            if (model.getStatus() == FileDownloadStatus.paused) {
+                if (FileDownloadLog.NEED_LOG) {
+                    /**
+                     * @see FileDownloadThreadPool#cancel(int), the invoking simultaneously
+                     * with here. And this area is invoking before there, so, {@code cancel(int)}
+                     * is fail.
+                     *
+                     * High concurrent cause.
+                     */
+                    FileDownloadLog.d(this, "High concurrent cause, start runnable but " +
+                            "already paused %d", model.getId());
+                }
 
-                } else {
-                    onError(new RuntimeException(
-                            FileDownloadUtils.formatString("Task[%d] can't start the download" +
-                                            " runnable, because its status is %d not %d",
-                                    model.getId(), model.getStatus(), FileDownloadStatus.pending)));
+            } else {
+                onError(new RuntimeException(
+                        FileDownloadUtils.formatString("Task[%d] can't start the download" +
+                                        " runnable, because its status is %d not %d",
+                                model.getId(), model.getStatus(), FileDownloadStatus.pending)));
+            }
+            return;
+        }
+
+        if (!paused) {
+            statusCallback.onStartThread();
+        }
+
+        do {
+            if (paused) {
+                if (FileDownloadLog.NEED_LOG) {
+                    /**
+                     * @see FileDownloadThreadPool#cancel(int), the invoking simultaneously
+                     * with here. And this area is invoking before there, so, {@code cancel(int)}
+                     * is fail.
+                     *
+                     * High concurrent cause.
+                     */
+                    FileDownloadLog.d(this, "High concurrent cause, start runnable but " +
+                            "already paused %d", model.getId());
                 }
                 return;
             }
 
-            if (!paused) {
-                statusCallback.onStartThread();
+            FileDownloadConnection connection = null;
+            try {
+
+
+                // 1. connect
+                checkupBeforeConnect();
+
+                // the first connection is for: 1. etag verify; 2. first connect.
+                final List<ConnectionModel> connectionOnDBList = database.findConnectionModel(model.getId());
+                final ConnectionProfile connectionProfile = buildFirstConnectProfile(connectionOnDBList);
+                final ConnectTask.Builder build = new ConnectTask.Builder();
+                final ConnectTask firstConnectionTask = build.setDownloadId(model.getId())
+                        .setUrl(model.getUrl())
+                        .setEtag(model.getETag())
+                        .setHeader(userRequestHeader)
+                        .setConnectionProfile(connectionProfile)
+                        .build();
+
+                connection = firstConnectionTask.connect();
+                handleFirstConnected(firstConnectionTask.getRequestHeader(), connection);
+
+                // 2. fetch
+                checkupBeforeFetch();
+                final long totalLength = model.getTotal();
+                // pre-allocate if need.
+                handlePreAllocate(totalLength, model.getTempFilePath());
+
+                final int connectionCount;
+                // start fetching
+                if (isMultiConnectionAvailable()) {
+                    if (isResumeAvailableOnDB) {
+                        connectionCount = model.getConnectionCount();
+                    } else {
+                        connectionCount = CustomComponentHolder.getImpl()
+                                .determineConnectionCount(model.getId(), model.getUrl(), model.getPath(), totalLength);
+                    }
+                } else {
+                    connectionCount = 1;
+                }
+
+                if (connectionCount <= 0) {
+                    throw new IllegalAccessException(FileDownloadUtils
+                            .formatString("invalid connection count %d, the connection count" +
+                                    " must be larger than 0", connection));
+                }
+
+                isSingleConnection = connectionCount == 1;
+                if (isSingleConnection) {
+                    // single connection
+                    fetchWithSingleConnection(firstConnectionTask.getProfile(), connection);
+                } else {
+                    // multiple connection
+                    statusCallback.onMultiConnection();
+                    if (isResumeAvailableOnDB) {
+                        fetchWithMultipleConnectionFromResume(connectionCount, connectionOnDBList);
+                    } else {
+                        fetchWithMultipleConnectionFromBeginning(totalLength, connectionCount);
+                    }
+                }
+
+            } catch (IOException | IllegalAccessException | InterruptedException e) {
+                if (isRetry(e)) {
+                    onRetry(e, 0);
+                    continue;
+                } else {
+                    onError(e);
+                }
+            } catch (DiscardSafely discardSafely) {
+                return;
+            } catch (RetryDirectly retryDirectly) {
+                model.setStatus(FileDownloadStatus.retry);
+                continue;
+            } finally {
+                if (connection != null) connection.ending();
             }
 
-            do {
-                if (paused) {
-                    if (FileDownloadLog.NEED_LOG) {
-                        /**
-                         * @see FileDownloadThreadPool#cancel(int), the invoking simultaneously
-                         * with here. And this area is invoking before there, so, {@code cancel(int)}
-                         * is fail.
-                         *
-                         * High concurrent cause.
-                         */
-                        FileDownloadLog.d(this, "High concurrent cause, start runnable but " +
-                                "already paused %d", model.getId());
-                    }
-                    return;
-                }
-
-                FileDownloadConnection connection = null;
-                try {
-
-
-                    // 1. connect
-                    checkupBeforeConnect();
-
-                    // the first connection is for: 1. etag verify; 2. first connect.
-                    final List<ConnectionModel> connectionOnDBList = database.findConnectionModel(model.getId());
-                    final ConnectionProfile connectionProfile = buildFirstConnectProfile(connectionOnDBList);
-                    final ConnectTask.Builder build = new ConnectTask.Builder();
-                    final ConnectTask firstConnectionTask = build.setDownloadId(model.getId())
-                            .setUrl(model.getUrl())
-                            .setEtag(model.getETag())
-                            .setHeader(userRequestHeader)
-                            .setConnectionProfile(connectionProfile)
-                            .build();
-
-                    connection = firstConnectionTask.connect();
-                    handleFirstConnected(firstConnectionTask.getRequestHeader(), connection);
-
-                    // 2. fetch
-                    checkupBeforeFetch();
-                    final long totalLength = model.getTotal();
-                    // pre-allocate if need.
-                    handlePreAllocate(totalLength, model.getTempFilePath());
-
-                    final int connectionCount;
-                    // start fetching
-                    if (isMultiConnectionAvailable()) {
-                        if (isResumeAvailableOnDB) {
-                            connectionCount = model.getConnectionCount();
-                        } else {
-                            connectionCount = CustomComponentHolder.getImpl()
-                                    .determineConnectionCount(model.getId(), model.getUrl(), model.getPath(), totalLength);
-                        }
-                    } else {
-                        connectionCount = 1;
-                    }
-
-                    if (connectionCount <= 0) {
-                        throw new IllegalAccessException(FileDownloadUtils
-                                .formatString("invalid connection count %d, the connection count" +
-                                        " must be larger than 0", connection));
-                    }
-
-                    isSingleConnection = connectionCount == 1;
-                    if (isSingleConnection) {
-                        // single connection
-                        fetchWithSingleConnection(firstConnectionTask.getProfile(), connection);
-                    } else {
-                        // multiple connection
-                        statusCallback.onMultiConnection();
-                        if (isResumeAvailableOnDB) {
-                            fetchWithMultipleConnectionFromResume(connectionCount, connectionOnDBList);
-                        } else {
-                            fetchWithMultipleConnectionFromBeginning(totalLength, connectionCount);
-                        }
-                    }
-
-                } catch (IOException | IllegalAccessException e) {
-                    if (isRetry(e)) {
-                        onRetry(e, 0);
-                        continue;
-                    } else {
-                        onError(e);
-                    }
-                } catch (DiscardSafely discardSafely) {
-                    return;
-                } catch (RetryDirectly retryDirectly) {
-                    model.setStatus(FileDownloadStatus.retry);
-                    continue;
-                } finally {
-                    if (connection != null) connection.ending();
-                }
-
-                break;
-            } while (true);
-        } finally {
-            alive = false;
-        }
+            break;
+        } while (true);
     }
 
     private boolean isMultiConnectionAvailable() {
@@ -430,14 +427,14 @@ public class DownloadLaunchRunnable implements Runnable, ProcessCallback {
         singleFetchDataTask.run();
     }
 
-    private void fetchWithMultipleConnectionFromResume(final int connectionCount, final List<ConnectionModel> connectionModelList) {
+    private void fetchWithMultipleConnectionFromResume(final int connectionCount, final List<ConnectionModel> connectionModelList) throws InterruptedException {
         if (connectionCount <= 1 || connectionModelList.size() != connectionCount)
             throw new IllegalArgumentException();
 
         fetchWithMultipleConnection(connectionModelList);
     }
 
-    private void fetchWithMultipleConnectionFromBeginning(final long totalLength, final int connectionCount) {
+    private void fetchWithMultipleConnectionFromBeginning(final long totalLength, final int connectionCount) throws InterruptedException {
         int startOffset = 0;
         final long eachRegion = totalLength / connectionCount;
         final int id = model.getId();
@@ -474,7 +471,7 @@ public class DownloadLaunchRunnable implements Runnable, ProcessCallback {
     }
 
 
-    private void fetchWithMultipleConnection(final List<ConnectionModel> connectionModelList) {
+    private void fetchWithMultipleConnection(final List<ConnectionModel> connectionModelList) throws InterruptedException {
         final int id = model.getId();
         final String etag = model.getETag();
         final String url = model.getUrl();
@@ -533,8 +530,17 @@ public class DownloadLaunchRunnable implements Runnable, ProcessCallback {
             model.setSoFar(totalOffset);
         }
 
+        List<Callable<Object>> subTasks = new ArrayList<>(downloadRunnableList.size());
         for (DownloadRunnable runnable : downloadRunnableList) {
-            DOWNLOAD_EXECUTOR.execute(runnable);
+            subTasks.add(Executors.callable(runnable));
+        }
+
+        List<Future<Object>> subTaskFutures = DOWNLOAD_EXECUTOR.invokeAll(subTasks);
+        if (FileDownloadLog.NEED_LOG) {
+            for (Future<Object> future : subTaskFutures) {
+                FileDownloadLog.d(this, "finish sub-task for [%d] %B %B",
+                        id, future.isDone(), future.isCancelled());
+            }
         }
     }
 
@@ -760,7 +766,7 @@ public class DownloadLaunchRunnable implements Runnable, ProcessCallback {
     }
 
     public boolean isAlive() {
-        return alive || this.statusCallback.isAlive();
+        return Thread.currentThread().isAlive() || this.statusCallback.isAlive();
     }
 
     public String getTempFilePath() {
